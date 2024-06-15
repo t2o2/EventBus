@@ -1,32 +1,42 @@
 package EventBus
 
 import (
+	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"reflect"
 	"sync"
 )
 
-//BusSubscriber defines subscription-related bus behavior
+const (
+	ReplyTopicPrefix = "_INBOX:"
+)
+
+type Void struct{}
+
+// BusSubscriber defines subscription-related bus behavior
 type BusSubscriber interface {
 	Subscribe(topic string, fn interface{}) error
 	SubscribeAsync(topic string, fn interface{}, transactional bool) error
 	SubscribeOnce(topic string, fn interface{}) error
 	SubscribeOnceAsync(topic string, fn interface{}) error
+	SubscribeReplyAsync(topic string, fn interface{}, transactional bool) error
 	Unsubscribe(topic string, handler interface{}) error
 }
 
-//BusPublisher defines publishing-related bus behavior
+// BusPublisher defines publishing-related bus behavior
 type BusPublisher interface {
 	Publish(topic string, args ...interface{})
+	Request(topic string, handler interface{}, args ...interface{}) error
 }
 
-//BusController defines bus control behavior (checking handler's presence, synchronization)
+// BusController defines bus control behavior (checking handler's presence, synchronization)
 type BusController interface {
 	HasCallback(topic string) bool
 	WaitAsync()
 }
 
-//Bus englobes global (subscribe, publish, control) bus behavior
+// Bus englobes global (subscribe, publish, control) bus behavior
 type Bus interface {
 	BusController
 	BusSubscriber
@@ -104,6 +114,27 @@ func (bus *EventBus) SubscribeOnceAsync(topic string, fn interface{}) error {
 	})
 }
 
+// SubcribeReplyAsync subscribes to a topic with an asynchronous callback
+func (bus *EventBus) SubscribeReplyAsync(topic string, fn interface{}, transactional bool) error {
+	fnValue := reflect.ValueOf(fn)
+	if fnValue.Kind() != reflect.Func {
+		return errors.New("fn must be a function")
+	}
+
+	fnType := fnValue.Type()
+	if fnType.NumIn() == 0 {
+		return errors.New("fn must have at least one input parameter")
+	}
+
+	if fnType.In(0).Kind() != reflect.String {
+		return errors.New("fn's first parameter (reply topic) must be a string")
+	}
+
+	return bus.doSubscribe(topic, fn, &eventHandler{
+		reflect.ValueOf(fn), false, true, transactional, sync.Mutex{},
+	})
+}
+
 // HasCallback returns true if exists any callback subscribed to the topic.
 func (bus *EventBus) HasCallback(topic string) bool {
 	bus.lock.Lock()
@@ -125,6 +156,26 @@ func (bus *EventBus) Unsubscribe(topic string, handler interface{}) error {
 		return nil
 	}
 	return fmt.Errorf("topic %s doesn't exist", topic)
+}
+
+func (bus *EventBus) Request(topic string, handler interface{}, args ...interface{}) error {
+	inboxStr := fmt.Sprintf("%v%v:%v", ReplyTopicPrefix, topic, uuid.NewString())
+	if !bus.HasCallback(topic) {
+		return fmt.Errorf("no responder on topic: %v", topic)
+	}
+	chResult := make(chan Void)
+	go func() {
+		err := bus.SubscribeOnce(inboxStr, handler)
+		fmt.Printf("subscribing: %v", inboxStr)
+		if err != nil {
+			fmt.Println("failed to subscribe to reply topic: %w", err)
+		}
+		chResult <- Void{}
+	}()
+	newArgs := append([]interface{}{inboxStr}, args...)
+	bus.Publish(topic, newArgs...)
+	<-chResult
+	return nil
 }
 
 // Publish executes callback defined for a topic. Any additional argument will be transferred to the callback.

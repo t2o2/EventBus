@@ -1,6 +1,7 @@
 package EventBus
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -163,7 +164,7 @@ func TestSubscribeAsync(t *testing.T) {
 	results := make(chan int)
 
 	bus := New()
-	bus.SubscribeAsync("topic", func(a int, out chan<- int) {
+	_ = bus.SubscribeAsync("topic", func(a int, out chan<- int) {
 		out <- a
 	}, false)
 
@@ -187,4 +188,45 @@ func TestSubscribeAsync(t *testing.T) {
 	//if numResults != 2 {
 	//	t.Fail()
 	//}
+}
+
+func TestRequestReply(t *testing.T) {
+	bus := New()
+	_ = bus.SubscribeReplyAsync("topic", func(replyTopic string, action string, in1 float64, in2 float64) {
+		var result float64
+		switch action {
+		case "add":
+			result = in1 + in2
+		case "sub":
+			result = in1 - in2
+		case "mul":
+			result = in1 * in2
+		case "div":
+			result = in1 / in2
+		}
+		fmt.Printf("received: %#v %#v %#v = %#v\n", action, in1, in2, result)
+		bus.Publish(replyTopic, result)
+	}, true)
+
+	replyHandler := func(data float64) {
+		fmt.Printf("response: %#v\n", data)
+	}
+
+	_ = bus.Request("topic", replyHandler, "add", 12.0, 10.0)
+	_ = bus.Request("topic", replyHandler, "sub", 12.0, 10.0)
+	_ = bus.Request("topic", replyHandler, "mul", 12.0, 10.0)
+	_ = bus.Request("topic", replyHandler, "div", 12.0, 10.0)
+
+	time.Sleep(10 * time.Millisecond)
+}
+
+func TestFailedRequestReply(t *testing.T) {
+	bus := New()
+	err := bus.SubscribeReplyAsync("topic", func(replyTopic int, action string, in1 float64, in2 float64) {
+	}, true)
+	if err != nil {
+		fmt.Println(err)
+	} else {
+		t.Fail()
+	}
 }
