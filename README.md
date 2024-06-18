@@ -48,6 +48,8 @@ func main() {
 * **Publish()**
 * **SubscribeAsync()**
 * **SubscribeOnceAsync()**
+* **SubscribeReplyAsync()**
+* **Request()**
 * **WaitAsync()**
 
 #### New()
@@ -115,6 +117,28 @@ Transactional determines whether subsequent callbacks for a topic are run serial
 
 #### SubscribeOnceAsync(topic string, args ...interface{})
 SubscribeOnceAsync works like SubscribeOnce except the callback to executed asynchronously
+
+#### SubscribeReplyAsync(topic string, fn interface{})
+SubscribeReplyAsync works like SubscribeAsync except the callback is expected to return a value. The value is returned to the caller of Publish.
+
+#### Request(topic string, handler interface{}, timeoutMs time.Duration, args ...interface{}) 
+Request is a function that allows you to make a request to a topic and wait for a response. The response is returned to the caller of `Request` as an interface{}.
+
+```go
+bus := EventBus.New()
+
+func slowCalculator(reply string, a, b int) {
+    time.Sleep(3 * time.Second)
+    bus.Publish(reply, a + b)
+}
+
+bus.SubscribeReplyAsync("main:slow_calculator", slowCalculator)
+
+reply := bus.Request("main:slow_calculator", func(rslt int) {
+    fmt.Printf("Result: %d\n", rslt)
+}, 20, 60)
+
+```
 
 ####  WaitAsync()
 WaitAsync waits for all async callbacks to complete.

@@ -2,6 +2,8 @@ package EventBus
 
 import (
 	"fmt"
+	"github.com/stretchr/testify/assert"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -206,27 +208,105 @@ func TestRequestReply(t *testing.T) {
 		}
 		fmt.Printf("received: %#v %#v %#v = %#v\n", action, in1, in2, result)
 		bus.Publish(replyTopic, result)
-	}, true)
+	})
+
+	counter := 0
 
 	replyHandler := func(data float64) {
 		fmt.Printf("response: %#v\n", data)
+		switch counter {
+		case 0:
+			assert.Equal(t, 22.0, data)
+		case 1:
+			assert.Equal(t, 2.0, data)
+		case 2:
+			assert.Equal(t, 120.0, data)
+		case 3:
+			assert.Equal(t, 1.2, data)
+		default:
+			assert.Fail(t, "unexpected response")
+		}
+		counter++
 	}
 
-	_ = bus.Request("topic", replyHandler, "add", 12.0, 10.0)
-	_ = bus.Request("topic", replyHandler, "sub", 12.0, 10.0)
-	_ = bus.Request("topic", replyHandler, "mul", 12.0, 10.0)
-	_ = bus.Request("topic", replyHandler, "div", 12.0, 10.0)
+	_ = bus.Request("topic", replyHandler, 10*time.Millisecond, "add", 12.0, 10.0)
+	_ = bus.Request("topic", replyHandler, 10*time.Millisecond, "sub", 12.0, 10.0)
+	_ = bus.Request("topic", replyHandler, 10*time.Millisecond, "mul", 12.0, 10.0)
+	_ = bus.Request("topic", replyHandler, 10*time.Millisecond, "div", 12.0, 10.0)
 
 	time.Sleep(10 * time.Millisecond)
 }
 
+func TestConcurrencyReply(t *testing.T) {
+	bus := New()
+	err := bus.SubscribeReplyAsync("concurrency", func(replyTopic string, in1 float64, in2 float64) {
+		time.Sleep(100 * time.Microsecond)
+		bus.Publish(replyTopic, in1, in2, in1+in2)
+	})
+	if err != nil {
+		assert.Fail(t, "failed to subscribe")
+	}
+	counter := atomic.Uint64{}
+	replyHandler := func(in1, in2, data float64) {
+		assert.Equal(t, in1+in2, data, "wrong value")
+		counter.Add(1)
+	}
+	errCounter := atomic.Uint64{}
+	for i := 0; i < 10000; i++ {
+		go func() {
+			err = bus.Request("concurrency", replyHandler, 200*time.Microsecond, float64(i), float64(10*i))
+			if err != nil {
+				errCounter.Add(1)
+			}
+		}()
+	}
+
+	time.Sleep(2 * time.Second)
+	fmt.Printf("counter: %d error: %d\n", counter.Load(), errCounter.Load())
+	assert.Equal(t, 10000, int(counter.Load()+errCounter.Load()), "wrong counter")
+}
+
+func TestConcurrentPubSub(t *testing.T) {
+	bus := New()
+	counter := atomic.Int64{}
+	bus.SubscribeAsync("concurrent", func() {
+		counter.Add(1)
+	}, false)
+	for i := 0; i < 10000; i++ {
+		go bus.Publish("concurrent")
+	}
+	bus.WaitAsync()
+	assert.Equal(t, 10000, int(counter.Load()), "wrong counter")
+}
+
 func TestFailedRequestReply(t *testing.T) {
 	bus := New()
-	err := bus.SubscribeReplyAsync("topic", func(replyTopic int, action string, in1 float64, in2 float64) {
-	}, true)
+	err := bus.SubscribeReplyAsync("topic", func(replyTopic int, action string, in1 float64, in2 float64) {})
 	if err != nil {
 		fmt.Println(err)
 	} else {
 		t.Fail()
 	}
+}
+
+func TestRequestReplyTimeout(t *testing.T) {
+	bus := New()
+	slowCalculator := func(reply string, a, b int) {
+		time.Sleep(1 * time.Second)
+		bus.Publish(reply, a+b)
+	}
+
+	_ = bus.SubscribeReplyAsync("main:slow_calculator", slowCalculator)
+
+	err := bus.Request("main:slow_calculator", func(rslt int) {
+		fmt.Printf("Result: %d\n", rslt)
+	}, 10*time.Millisecond, 20, 60)
+	assert.NotNil(t, err, "Request should return timeout error")
+
+	err = bus.Request("main:slow_calculator", func(rslt int) {
+		fmt.Printf("Result: %d\n", rslt)
+	}, 2*time.Second, 20, 90)
+	assert.Nil(t, err, "Request should not return an error")
+
+	time.Sleep(100 * time.Millisecond)
 }

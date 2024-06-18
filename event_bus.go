@@ -6,6 +6,7 @@ import (
 	"github.com/google/uuid"
 	"reflect"
 	"sync"
+	"time"
 )
 
 const (
@@ -20,14 +21,14 @@ type BusSubscriber interface {
 	SubscribeAsync(topic string, fn interface{}, transactional bool) error
 	SubscribeOnce(topic string, fn interface{}) error
 	SubscribeOnceAsync(topic string, fn interface{}) error
-	SubscribeReplyAsync(topic string, fn interface{}, transactional bool) error
+	SubscribeReplyAsync(topic string, fn interface{}) error
 	Unsubscribe(topic string, handler interface{}) error
 }
 
 // BusPublisher defines publishing-related bus behavior
 type BusPublisher interface {
 	Publish(topic string, args ...interface{})
-	Request(topic string, handler interface{}, args ...interface{}) error
+	Request(topic string, handler interface{}, timeout time.Duration, args ...interface{}) error
 }
 
 // BusController defines bus control behavior (checking handler's presence, synchronization)
@@ -45,9 +46,9 @@ type Bus interface {
 
 // EventBus - box for handlers and callbacks.
 type EventBus struct {
-	handlers map[string][]*eventHandler
-	lock     sync.Mutex // a lock for the map
-	wg       sync.WaitGroup
+	mapHandlers sync.Map
+	lock        sync.Mutex // a lock for the map
+	wg          sync.WaitGroup
 }
 
 type eventHandler struct {
@@ -61,7 +62,7 @@ type eventHandler struct {
 // New returns new EventBus with empty handlers.
 func New() Bus {
 	b := &EventBus{
-		make(map[string][]*eventHandler),
+		sync.Map{},
 		sync.Mutex{},
 		sync.WaitGroup{},
 	}
@@ -70,12 +71,15 @@ func New() Bus {
 
 // doSubscribe handles the subscription logic and is utilized by the public Subscribe functions
 func (bus *EventBus) doSubscribe(topic string, fn interface{}, handler *eventHandler) error {
-	bus.lock.Lock()
-	defer bus.lock.Unlock()
 	if !(reflect.TypeOf(fn).Kind() == reflect.Func) {
 		return fmt.Errorf("%s is not of type reflect.Func", reflect.TypeOf(fn).Kind())
 	}
-	bus.handlers[topic] = append(bus.handlers[topic], handler)
+	// rewrite in sync.Map
+	if _, ok := bus.mapHandlers.Load(topic); !ok {
+		bus.mapHandlers.Store(topic, []*eventHandler{})
+	}
+	handlers, _ := bus.mapHandlers.Load(topic)
+	bus.mapHandlers.Store(topic, append(handlers.([]*eventHandler), handler))
 	return nil
 }
 
@@ -115,7 +119,7 @@ func (bus *EventBus) SubscribeOnceAsync(topic string, fn interface{}) error {
 }
 
 // SubcribeReplyAsync subscribes to a topic with an asynchronous callback
-func (bus *EventBus) SubscribeReplyAsync(topic string, fn interface{}, transactional bool) error {
+func (bus *EventBus) SubscribeReplyAsync(topic string, fn interface{}) error {
 	fnValue := reflect.ValueOf(fn)
 	if fnValue.Kind() != reflect.Func {
 		return errors.New("fn must be a function")
@@ -131,17 +135,18 @@ func (bus *EventBus) SubscribeReplyAsync(topic string, fn interface{}, transacti
 	}
 
 	return bus.doSubscribe(topic, fn, &eventHandler{
-		reflect.ValueOf(fn), false, true, transactional, sync.Mutex{},
+		reflect.ValueOf(fn), false, true, false, sync.Mutex{},
 	})
 }
 
 // HasCallback returns true if exists any callback subscribed to the topic.
 func (bus *EventBus) HasCallback(topic string) bool {
 	bus.lock.Lock()
-	defer bus.lock.Unlock()
-	_, ok := bus.handlers[topic]
-	if ok {
-		return len(bus.handlers[topic]) > 0
+	defer func() {
+		bus.lock.Unlock()
+	}()
+	if handlers, ok := bus.mapHandlers.Load(topic); ok {
+		return len(handlers.([]*eventHandler)) > 0
 	}
 	return false
 }
@@ -149,42 +154,71 @@ func (bus *EventBus) HasCallback(topic string) bool {
 // Unsubscribe removes callback defined for a topic.
 // Returns error if there are no callbacks subscribed to the topic.
 func (bus *EventBus) Unsubscribe(topic string, handler interface{}) error {
-	bus.lock.Lock()
-	defer bus.lock.Unlock()
-	if _, ok := bus.handlers[topic]; ok && len(bus.handlers[topic]) > 0 {
-		bus.removeHandler(topic, bus.findHandlerIdx(topic, reflect.ValueOf(handler)))
-		return nil
+	if iHandlers, ok := bus.mapHandlers.Load(topic); ok {
+		handlers := iHandlers.([]*eventHandler)
+		for i, h := range handlers {
+			if h.callBack.Type() == reflect.ValueOf(handler).Type() &&
+				h.callBack.Pointer() == reflect.ValueOf(handler).Pointer() {
+				handlers = append(handlers[:i], handlers[i+1:]...)
+				bus.mapHandlers.Store(topic, handlers)
+				return nil
+			}
+		}
 	}
 	return fmt.Errorf("topic %s doesn't exist", topic)
 }
 
-func (bus *EventBus) Request(topic string, handler interface{}, args ...interface{}) error {
+func (bus *EventBus) Request(topic string, handler interface{}, timeout time.Duration, args ...interface{}) error {
 	inboxStr := fmt.Sprintf("%v%v:%v", ReplyTopicPrefix, topic, uuid.NewString())
 	if !bus.HasCallback(topic) {
 		return fmt.Errorf("no responder on topic: %v", topic)
 	}
 	chResult := make(chan Void)
-	go func() {
-		err := bus.SubscribeOnce(inboxStr, handler)
-		fmt.Printf("subscribing: %v", inboxStr)
-		if err != nil {
-			fmt.Println("failed to subscribe to reply topic: %w", err)
-		}
+
+	wrapperHandler := func(args ...interface{}) {
 		chResult <- Void{}
-	}()
+		handlerValue := reflect.ValueOf(handler)
+		if handlerValue.Kind() != reflect.Func {
+			fmt.Printf("handler is not a function: %v\n", handler)
+			return
+		}
+		handlerArgs := make([]reflect.Value, len(args))
+		for i, arg := range args {
+			handlerArgs[i] = reflect.ValueOf(arg)
+		}
+		handlerValue.Call(handlerArgs)
+	}
+	err := bus.SubscribeOnce(inboxStr, wrapperHandler)
+	// fmt.Printf("subscribing: %v\n", inboxStr)
+	if err != nil {
+		fmt.Println("failed to subscribe to reply topic: %w", err)
+	}
 	newArgs := append([]interface{}{inboxStr}, args...)
 	bus.Publish(topic, newArgs...)
-	<-chResult
-	return nil
+
+	timer := time.NewTimer(timeout)
+	select {
+	case <-chResult:
+		return nil
+	case <-timer.C:
+		// err = bus.Unsubscribe(inboxStr, wrapperHandler)
+		// if err != nil {
+		// 	err = fmt.Errorf("failed to unsubscribe: %v %w", inboxStr, err)
+		// }
+		// if err != nil {
+		// 	err = fmt.Errorf("request timed out %w", err)
+		// } else {
+		// 	err = fmt.Errorf("request timed out")
+		// }
+		// return err
+		return fmt.Errorf("request timed out")
+	}
 }
 
 // Publish executes callback defined for a topic. Any additional argument will be transferred to the callback.
 func (bus *EventBus) Publish(topic string, args ...interface{}) {
-	bus.lock.Lock() // will unlock if handler is not found or always after setUpPublish
-	defer bus.lock.Unlock()
-	if handlers, ok := bus.handlers[topic]; ok && 0 < len(handlers) {
-		// Handlers slice may be changed by removeHandler and Unsubscribe during iteration,
-		// so make a copy and iterate the copied slice.
+	if iHandlers, ok := bus.mapHandlers.Load(topic); ok {
+		handlers := iHandlers.([]*eventHandler)
 		copyHandlers := make([]*eventHandler, len(handlers))
 		copy(copyHandlers, handlers)
 		for i, handler := range copyHandlers {
@@ -196,9 +230,7 @@ func (bus *EventBus) Publish(topic string, args ...interface{}) {
 			} else {
 				bus.wg.Add(1)
 				if handler.transactional {
-					bus.lock.Unlock()
 					handler.Lock()
-					bus.lock.Lock()
 				}
 				go bus.doPublishAsync(handler, topic, args...)
 			}
@@ -220,28 +252,23 @@ func (bus *EventBus) doPublishAsync(handler *eventHandler, topic string, args ..
 }
 
 func (bus *EventBus) removeHandler(topic string, idx int) {
-	if _, ok := bus.handlers[topic]; !ok {
-		return
+	if iHandlers, ok := bus.mapHandlers.Load(topic); ok {
+		handlers := iHandlers.([]*eventHandler)
+		bus.mapHandlers.Store(topic, append(handlers[:idx], handlers[idx+1:]...))
 	}
-	l := len(bus.handlers[topic])
-
-	if !(0 <= idx && idx < l) {
-		return
-	}
-
-	copy(bus.handlers[topic][idx:], bus.handlers[topic][idx+1:])
-	bus.handlers[topic][l-1] = nil // or the zero value of T
-	bus.handlers[topic] = bus.handlers[topic][:l-1]
 }
 
 func (bus *EventBus) findHandlerIdx(topic string, callback reflect.Value) int {
-	if _, ok := bus.handlers[topic]; ok {
-		for idx, handler := range bus.handlers[topic] {
+	// rewrite in sync.Map
+	if iHandlers, ok := bus.mapHandlers.Load(topic); ok {
+		handlers := iHandlers.([]*eventHandler)
+		for idx, handler := range handlers {
 			if handler.callBack.Type() == callback.Type() &&
 				handler.callBack.Pointer() == callback.Pointer() {
 				return idx
 			}
 		}
+
 	}
 	return -1
 }
