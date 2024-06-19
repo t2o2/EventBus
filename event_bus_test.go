@@ -206,14 +206,12 @@ func TestRequestReply(t *testing.T) {
 		case "div":
 			result = in1 / in2
 		}
-		fmt.Printf("received: %#v %#v %#v = %#v\n", action, in1, in2, result)
 		bus.Publish(replyTopic, result)
 	})
 
 	counter := 0
 
 	replyHandler := func(data float64) {
-		fmt.Printf("response: %#v\n", data)
 		switch counter {
 		case 0:
 			assert.Equal(t, 22.0, data)
@@ -269,12 +267,21 @@ func TestConcurrencyReply(t *testing.T) {
 func TestConcurrentPubSub(t *testing.T) {
 	bus := New()
 	counter := atomic.Int64{}
-	bus.SubscribeAsync("concurrent", func() {
+	end := make(chan Void)
+	total := 10000
+	err := bus.SubscribeAsync("concurrent", func() {
 		counter.Add(1)
+		if counter.Load() == int64(total) {
+			end <- Void{}
+		}
 	}, false)
+	if err != nil {
+		assert.Fail(t, "failed to subscribe")
+	}
 	for i := 0; i < 10000; i++ {
 		go bus.Publish("concurrent")
 	}
+	<-end
 	bus.WaitAsync()
 	assert.Equal(t, 10000, int(counter.Load()), "wrong counter")
 }

@@ -201,17 +201,16 @@ func (bus *EventBus) Request(topic string, handler interface{}, timeout time.Dur
 	case <-chResult:
 		return nil
 	case <-timer.C:
-		// err = bus.Unsubscribe(inboxStr, wrapperHandler)
-		// if err != nil {
-		// 	err = fmt.Errorf("failed to unsubscribe: %v %w", inboxStr, err)
-		// }
-		// if err != nil {
-		// 	err = fmt.Errorf("request timed out %w", err)
-		// } else {
-		// 	err = fmt.Errorf("request timed out")
-		// }
-		// return err
-		return fmt.Errorf("request timed out")
+		err = bus.Unsubscribe(inboxStr, wrapperHandler)
+		if err != nil {
+			err = fmt.Errorf("failed to unsubscribe: %v %w", inboxStr, err)
+		}
+		if err != nil {
+			err = fmt.Errorf("request timed out %w", err)
+		} else {
+			err = fmt.Errorf("request timed out")
+		}
+		return err
 	}
 }
 
@@ -254,7 +253,9 @@ func (bus *EventBus) doPublishAsync(handler *eventHandler, topic string, args ..
 func (bus *EventBus) removeHandler(topic string, idx int) {
 	if iHandlers, ok := bus.mapHandlers.Load(topic); ok {
 		handlers := iHandlers.([]*eventHandler)
-		bus.mapHandlers.Store(topic, append(handlers[:idx], handlers[idx+1:]...))
+		if len(handlers) > idx && idx >= 0 {
+			bus.mapHandlers.Store(topic, append(handlers[:idx], handlers[idx+1:]...))
+		}
 	}
 }
 
